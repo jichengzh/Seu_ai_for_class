@@ -645,293 +645,258 @@ function ChapterProgress({ sections, currentSection }) {
 
 ## Phase 3：后端 — 代码仓库生成
 
-### 3.1 Claude Agent SDK 集成 `src/agents/project/agents/code_generator.py`
+> ✅ **已实现**。认证方式与原计划不同：不使用 `ANTHROPIC_API_KEY`，改为复用本机
+> Claude Code 的 OAuth Token（`~/.claude/.credentials.json`，Pro 订阅）。
+> 不需要 `claude-agent-sdk` Python 包，统一走 CLI subprocess。
 
-**依赖安装（需加入 requirements.txt）：**
-```
-claude-agent-sdk>=0.1.0
+### 3.1 新增文件
+
+| 文件 | 作用 |
+|------|------|
+| `src/agents/project/agents/requirement_extractor.py` | 用现有 LLM factory 从任务书提取 `RequirementSpec`（不需要 Anthropic key） |
+| `src/agents/project/agents/code_generator.py` | 三阶段生成：规划(B) → 编码(C) → 验证修复(D)，subprocess 调用 claude CLI |
+| `src/agents/project/agents/code_verifier.py` | pip install + 主模块导入 + pytest 冒烟测试 |
+
+**前置条件（无需 API key）：**
+```bash
+# 1. claude CLI 已安装
+npm install -g @anthropic-ai/claude-code
+
+# 2. 已通过 OAuth 登录（Claude Pro 订阅）
+claude login
+
+# 凭据存储在 ~/.claude/.credentials.json，subscriptionType: "pro"
+# DeepTutor 调用 claude subprocess 时不注入任何 API key，CLI 自动读取凭据
 ```
 
-**新增环境变量（.env）：**
-```
-ANTHROPIC_API_KEY=sk-ant-xxx    # Claude Agent SDK 需要（独立于 DashScope）
-```
-
-**代码实现：**
+**RequirementSpec 数据结构（需求提取器输出）：**
 ```python
-import asyncio
-import json
-import os
-from pathlib import Path
-from typing import AsyncGenerator, Callable
+@dataclass
+class TaskModule:
+    id: str
+    title: str
+    objectives: list[str]
+    technical_requirements: list[str]
+    deliverables: list[str]
 
+@dataclass
+class RequirementSpec:
+    theme: str
+    tech_stack: list[str]
+    environment: str
+    install_requirements: list[str]
+    modules: list[TaskModule]
+    coverage_map: dict[str, list[str]]   # 生成后回填
+```
+
+**CodeGenerator 实际接口：**
+```python
 class CodeGenerator:
     """
-    调用 Claude Agent SDK 生成项目代码仓库
-    优先使用 claude-agent-sdk，降级到 claude CLI subprocess
+    通过 subprocess 调用本机 claude CLI（OAuth，无 API key）。
+    模型跟随 Claude Code 当前配置，不在 DeepTutor 侧指定。
     """
+    CLAUDE_BIN: str  # shutil.which("claude") 或 ~/.local/bin/claude
 
-    def __init__(self, anthropic_api_key: str | None = None):
-        self.api_key = anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+    def __init__(self) -> None:
+        # 检查 claude CLI 文件是否存在；不存在则抛 EnvironmentError
+        ...
 
     async def generate(
         self,
-        task_document: str,
+        spec: RequirementSpec,    # ← 注意：不是 task_document: str
         output_dir: str,
-        ws_callback: Callable
+        ws_callback: Callable,
     ) -> dict:
-        """生成代码仓库，流式推送进度"""
-        repo_dir = Path(output_dir) / "repo"
-        repo_dir.mkdir(parents=True, exist_ok=True)
+        # 返回：{"repo_path", "file_tree", "coverage_map", "verify_passed", "verify_report"}
+        ...
 
-        # 构建代码生成提示词
-        prompt = self._build_prompt(task_document)
-
-        try:
-            # 方案A：claude-agent-sdk
-            from claude_agent_sdk import query, ClaudeAgentOptions
-            async for message in query(
-                prompt=prompt,
-                options=ClaudeAgentOptions(
-                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob"],
-                    working_directory=str(repo_dir),
-                )
-            ):
-                await self._handle_sdk_message(message, ws_callback)
-
-        except ImportError:
-            # 方案B：claude CLI subprocess
-            await self._generate_via_cli(prompt, str(repo_dir), ws_callback)
-
-        # 收集生成的文件树
-        file_tree = self._build_file_tree(repo_dir)
-        return {"repo_path": str(repo_dir), "file_tree": file_tree}
-
-    async def _generate_via_cli(self, prompt: str, cwd: str, ws_callback: Callable):
-        """通过 subprocess 调用 claude CLI（stream-json 模式）"""
+    async def _run_via_cli(self, prompt, cwd, allowed_tools, ws_callback):
         process = await asyncio.create_subprocess_exec(
-            "claude", "-p", prompt,
-            "--allowedTools", "Bash,Read,Write,Edit,Glob",
+            self.CLAUDE_BIN, "-p", prompt,
+            "--allowedTools", ",".join(allowed_tools),
             "--output-format", "stream-json",
             cwd=cwd,
-            env={**os.environ, "ANTHROPIC_API_KEY": self.api_key},
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            env=os.environ,    # 原样传递，不注入 ANTHROPIC_API_KEY
+            ...
         )
-
-        async for line in process.stdout:
-            line_str = line.decode().strip()
-            if not line_str:
-                continue
-            try:
-                event = json.loads(line_str)
-                await self._handle_cli_event(event, ws_callback)
-            except json.JSONDecodeError:
-                pass
-
-        await process.wait()
-
-    async def _handle_sdk_message(self, message, ws_callback):
-        """处理 claude-agent-sdk 的消息，转换为前端格式"""
-        # 工具调用日志
-        if hasattr(message, "tool_use"):
-            await ws_callback({
-                "type": "agent_log",
-                "log_type": "tool_use",
-                "tool": message.tool_use.name,
-                "path": message.tool_use.input.get("path", ""),
-                "content": f"使用工具: {message.tool_use.name}"
-            })
-        # 文件变更通知
-        if hasattr(message, "tool_result"):
-            if message.tool_use.name in ["Write", "Edit"]:
-                await ws_callback({
-                    "type": "file_created",
-                    "path": message.tool_use.input.get("path", "")
-                })
-
-    def _build_prompt(self, task_document: str) -> str:
-        return f"""请根据以下任务书，创建一个完整的项目代码仓库：
-
-{task_document}
-
-要求：
-1. 首先 git init 初始化仓库
-2. 创建清晰的项目目录结构
-3. 编写 README.md（包含项目说明、安装步骤、使用方法）
-4. 生成主要功能模块的骨架代码（带注释）
-5. 创建 requirements.txt 或对应的依赖文件
-6. 代码结构清晰，符合该技术栈的最佳实践
-"""
-
-    def _build_file_tree(self, base_dir: Path) -> list:
-        """递归构建文件树（排除 .git 目录）"""
-        result = []
-        for item in sorted(base_dir.iterdir()):
-            if item.name == ".git":
-                continue
-            node = {"name": item.name, "path": str(item.relative_to(base_dir)), "type": "directory" if item.is_dir() else "file"}
-            if item.is_dir():
-                node["children"] = self._build_file_tree(item)
-            result.append(node)
-        return result
 ```
 
-### 3.2 generate-code WebSocket 端点
+### 3.2 generate-code WebSocket 端点（实际实现）
 
+**消息协议（更新）：**
+```python
+# 客户端 → 服务端
+{"session_id": "proj_xxx", "task_content": "## 课程背景\n..."}
+
+# 服务端 → 客户端（顺序）
+{"type": "phase",        "phase": "analysis", "content": "正在分析任务书需求..."}
+{"type": "phase",        "phase": "planning", "content": "正在制定项目架构..."}
+{"type": "phase",        "phase": "coding",   "content": "Claude Agent 开始编写代码..."}
+{"type": "phase",        "phase": "verify",   "content": "正在验证代码可运行性..."}
+{"type": "agent_log",    "log_type": "tool_use"|"tool_result"|"message"|"error",
+                         "tool": "Write"|"Bash"|..., "path": "src/main.py", "content": "..."}
+{"type": "file_created", "path": "src/main.py"}
+{"type": "verify_result","passed": true|false, "report": "..."}
+{"type": "coverage",     "map": {"module_1": ["src/main.py"]}}
+{"type": "complete",     "session_id": "...", "repo_path": "...",
+                         "file_tree": [...], "coverage_map": {...}, "verify_passed": true}
+{"type": "error",        "content": "找不到 claude CLI..."}
+```
+
+**端点逻辑（与原计划的关键差异）：**
 ```python
 @router.websocket("/project/generate-code")
 async def websocket_generate_code(websocket: WebSocket):
-    await websocket.accept()
-    log_queue = asyncio.Queue()
-
+    ...
+    # 检查 claude CLI（不检查 ANTHROPIC_API_KEY）
     try:
-        data = await websocket.receive_json()
-        session_id = data.get("session_id")
-        task_content = data.get("task_content", "")
-
-        session_mgr = ProjectSessionManager()
-        session = session_mgr.get_session(session_id)
-        output_dir = get_project_output_dir(session_id)
-
-        # 更新状态
-        session_mgr.update_session(session_id, status="code_generating")
-        await websocket.send_json({"type": "status", "content": "正在初始化 Claude Agent SDK..."})
-
-        # 检查 ANTHROPIC_API_KEY
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            await websocket.send_json({"type": "error", "content": "未配置 ANTHROPIC_API_KEY，请在 .env 中添加"})
-            return
-
-        # 创建 CodeGenerator
-        generator = CodeGenerator(anthropic_api_key=api_key)
-
-        async def ws_callback(msg: dict):
-            await log_queue.put(msg)
-
-        # 启动日志推送
-        pusher_task = asyncio.create_task(log_pusher(log_queue, websocket))
-
-        # 执行代码生成
-        result = await generator.generate(
-            task_document=task_content,
-            output_dir=str(output_dir),
-            ws_callback=ws_callback
-        )
-
-        await log_queue.put(None)
-        await pusher_task
-
-        session_mgr.update_session(session_id, status="complete", repo_path=result["repo_path"])
-        await websocket.send_json({
-            "type": "complete",
-            "repo_path": result["repo_path"],
-            "file_tree": result["file_tree"]
-        })
-
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
+        generator = CodeGenerator()    # 构造时验证 CLI 是否存在
+    except EnvironmentError as e:
         await websocket.send_json({"type": "error", "content": str(e)})
+        return
+
+    # 阶段 A：需求提取（用现有 LLM factory，不需要 Anthropic key）
+    extractor = RequirementExtractor()
+    spec = await extractor.extract(task_content, ws_callback)
+
+    # 阶段 B/C/D：代码生成 + 验证
+    result = await generator.generate(spec=spec, output_dir=output_dir, ws_callback=ws_callback)
+
+    await websocket.send_json({
+        "type": "complete",
+        "session_id": session_id,
+        "repo_path": result["repo_path"],
+        "file_tree": result["file_tree"],
+        "coverage_map": result["coverage_map"],    # ← 原计划缺少
+        "verify_passed": result["verify_passed"],   # ← 原计划缺少
+    })
+```
+
+### 3.3 download-repo 端点（原计划缺少）
+
+```python
+GET /project/{session_id}/download-repo
+# 将 data/user/projects/{id}/repo/ 打包为 zip 返回（排除 .git，限制 500 MB）
 ```
 
 ---
 
 ## Phase 4：前端 — 代码生成 UI
 
-### 4.1 AgentLog 组件
+> ✅ **已实现**，与 Phase 3 后端同步完成。整合在 `web/app/project/page.tsx` Step 4
+> 和 `web/context/GlobalContext.tsx` 中，不是独立的 Phase。
+
+### 4.1 ProjectState 新增字段（原计划缺少）
 
 ```typescript
-// Agent 操作日志条目
-function AgentLogEntry({ entry }: { entry: AgentLogEntry }) {
-  const icons = { Write: "📝", Edit: "✏️", Bash: "⚡", Read: "📖", Glob: "🔍" };
-  return (
-    <div className="flex items-start gap-2 text-sm font-mono py-1">
-      <span className="text-gray-400 text-xs">{entry.timestamp}</span>
-      <span>{icons[entry.tool] || "🔧"}</span>
-      <span className={cn("font-semibold", entry.type === "error" ? "text-red-400" : "text-blue-400")}>
-        {entry.tool}
-      </span>
-      {entry.path && <span className="text-gray-300 truncate">{entry.path}</span>}
-    </div>
-  );
+interface ProjectState {
+  // ... 原有字段 ...
+  // Phase 3 新增：
+  agentLogs: AgentLogEntry[];
+  generatedFiles: FileTreeNode[];
+  repoPath: string | null;
+  verifyPassed: boolean | null;      // ← 原计划缺少
+  coverageMap: Record<string, string[]> | null;  // ← 原计划缺少
 }
 ```
 
-### 4.2 文件树组件
+### 4.2 GlobalContext 中的 startCodeGeneration（实际实现）
 
 ```typescript
-function FileTree({ nodes }: { nodes: FileTreeNode[] }) {
-  return (
-    <ul className="text-sm font-mono">
-      {nodes.map(node => (
-        <li key={node.path}>
-          <div className="flex items-center gap-1 py-0.5 hover:bg-gray-100">
-            {node.type === "directory" ? <FolderIcon /> : <FileIcon />}
-            <span>{node.name}</span>
-          </div>
-          {node.children && <ul className="pl-4"><FileTree nodes={node.children} /></ul>}
-        </li>
-      ))}
-    </ul>
-  );
-}
-```
-
-### 4.3 GlobalContext 中的 startCodeGeneration
-
-```typescript
-const startCodeGeneration = () => {
+const startCodeGeneration = useCallback(() => {
   if (projectWs.current) projectWs.current.close();
-  setProjectState(prev => ({ ...prev, step: "code_generating", agentLogs: [], generatedFiles: [] }));
+  setProjectState(prev => ({
+    ...prev,
+    step: "code_generating",
+    agentLogs: [], generatedFiles: [],
+    repoPath: null, verifyPassed: null, coverageMap: null, error: null,
+  }));
 
-  const ws = new WebSocket(wsUrl("/api/v1/project/generate-code"));
+  // 注意：不使用 wsUrl()，直接替换 env var 以避免模块初始化时的异常
+  const base = process.env.NEXT_PUBLIC_API_BASE || "";
+  const wsBase = base.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+  const ws = new WebSocket(`${wsBase}/api/v1/project/generate-code`);
   projectWs.current = ws;
 
   ws.onopen = () => {
     ws.send(JSON.stringify({
-      session_id: projectState.sessionId,
-      task_content: projectState.taskContent
+      session_id: projectStateRef.current.sessionId,    // 用 ref 避免闭包问题
+      task_content: projectStateRef.current.taskContent,
     }));
   };
 
   ws.onmessage = (event) => {
     const data = JSON.parse(event.data);
     switch (data.type) {
-      case "agent_log":
-        setProjectState(prev => ({ ...prev, agentLogs: [...prev.agentLogs, { ...data, timestamp: new Date().toLocaleTimeString() }] }));
+      case "phase":         // ← 原计划缺少
+        setProjectState(prev => ({ ...prev, logs: [...prev.logs, { type: "status", content: data.content, timestamp: Date.now() }] }));
         break;
-      case "file_created":
-        // 增量更新文件树（通过重新请求或维护本地状态）
+      case "agent_log":
+        setProjectState(prev => ({
+          ...prev,
+          agentLogs: [...prev.agentLogs.slice(-499), { timestamp: new Date().toLocaleTimeString(), type: data.log_type, tool: data.tool, path: data.path, content: data.content }],
+        }));
+        break;
+      case "verify_result": // ← 原计划缺少
+        setProjectState(prev => ({ ...prev, logs: [...prev.logs, { type: data.passed ? "status" : "error", content: data.passed ? `验证通过：${data.report}` : `验证失败：${data.report}`, timestamp: Date.now() }] }));
+        break;
+      case "coverage":      // ← 原计划缺少
+        setProjectState(prev => ({ ...prev, coverageMap: data.map }));
         break;
       case "complete":
-        setProjectState(prev => ({ ...prev, step: "complete", repoPath: data.repo_path, generatedFiles: data.file_tree }));
+        setProjectState(prev => ({
+          ...prev,
+          step: "complete",
+          repoPath: data.repo_path,
+          generatedFiles: data.file_tree,
+          coverageMap: data.coverage_map,    // ← 原计划缺少
+          verifyPassed: data.verify_passed,   // ← 原计划缺少
+        }));
         break;
       case "error":
         setProjectState(prev => ({ ...prev, step: "task_review", error: data.content }));
         break;
     }
   };
-};
+}, []);
 ```
+
+### 4.3 Step 4 页面布局（实际实现）
+
+```
+左 1/3：Agent 操作日志（深色终端风格，滚动，最多 500 条）
+右 2/3：
+  ├── 验证状态栏（绿色/红色）
+  ├── 文件树（目录/文件图标，递归渲染）
+  ├── 需求覆盖率（模块 ID → 文件列表）
+  └── 操作按钮：[下载代码 zip] [新建项目]
+```
+
+下载按钮调用 `GET /api/v1/project/{sessionId}/download-repo`，返回 zip 包。
 
 ---
 
 ## Phase 5：集成测试
 
-### 5.1 后端单元测试
+### 5.1 后端单元测试（实际测试文件）
 
+```
+tests/test_task_parser.py       —  7 个测试，覆盖 docx/pdf 解析
+tests/test_session_manager.py   —  8 个测试，覆盖会话 CRUD
+tests/test_project_router.py    —  8 个测试，覆盖 REST 端点
+tests/test_task_generator.py    —  3 个测试，覆盖流式生成逻辑
+tests/test_code_generator.py    — 17 个测试，覆盖 RequirementExtractor / CodeVerifier / CodeGenerator
+```
+
+关键测试用例（已实现）：
 ```python
-# tests/test_project_task_generator.py
-async def test_task_generator_structure():
-    """验证生成的任务书包含所有 9 个章节"""
-
-async def test_task_parser_docx():
-    """验证 .docx 解析正确提取章节结构"""
-
-async def test_code_generator_sdk_fallback():
-    """验证 SDK 不可用时降级到 CLI"""
+# tests/test_code_generator.py
+async def test_extract_valid_json():                    # RequirementExtractor 正常解析
+async def test_extract_invalid_json_returns_minimal_spec()  # LLM 返回无效 JSON 时降级
+async def test_verify_syntax_error_fails():             # CodeVerifier 检测语法错误
+def test_missing_claude_bin_raises():                   # CLI 不存在时抛 EnvironmentError
+def test_build_file_tree_excludes_git():                # 文件树排除 .git 目录
 ```
 
 ### 5.2 端到端测试步骤
@@ -948,24 +913,25 @@ async def test_code_generator_sdk_fallback():
 
 ## 实现优先级与顺序
 
-| 顺序 | 任务 | 预期耗时 | 依赖 |
-|------|------|---------|------|
-| 1 | task_parser.py | - | python-docx |
-| 2 | project.py (upload-reference) | - | task_parser |
-| 3 | task_generator.py (基础版，无流式) | - | 现有 LLM |
-| 4 | project.py (generate-task WebSocket) | - | task_generator |
-| 5 | session_manager.py | - | - |
-| 6 | main.py 注册路由 | - | project.py |
-| 7 | Sidebar.tsx 添加菜单 | - | - |
-| 8 | GlobalContext.tsx 添加 state | - | - |
-| 9 | project/page.tsx (Step 1-3) | - | 后端 Phase 1 |
-| 10 | task_generator.py 改为流式输出 | - | 基础版完成 |
-| 11 | 添加 RAG + Web Search | - | 流式版完成 |
-| 12 | ANTHROPIC_API_KEY 配置 | - | - |
-| 13 | code_generator.py | - | claude-agent-sdk |
-| 14 | project.py (generate-code WebSocket) | - | code_generator |
-| 15 | project/page.tsx (Step 4) | - | 后端 Phase 3 |
-| 16 | 端到端集成测试 | - | 全部完成 |
+| 顺序 | 任务 | 状态 | 依赖 |
+|------|------|------|------|
+| 1 | task_parser.py | ✅ | python-docx |
+| 2 | project.py (upload-reference) | ✅ | task_parser |
+| 3 | task_generator.py (基础版，无流式) | ✅ | 现有 LLM |
+| 4 | project.py (generate-task WebSocket) | ✅ | task_generator |
+| 5 | session_manager.py | ✅ | — |
+| 6 | main.py 注册路由 | ✅ | project.py |
+| 7 | Sidebar.tsx 添加菜单 | ✅ | — |
+| 8 | GlobalContext.tsx 添加 state | ✅ | — |
+| 9 | project/page.tsx (Step 1-3) | ✅ | 后端 Phase 1 |
+| 10 | task_generator.py 改为流式输出 | ✅ | 基础版完成 |
+| 11 | 添加 RAG + Web Search | ✅ | 流式版完成 |
+| 12 | 确认 claude CLI 已安装并 OAuth 登录 | ✅ | claude login |
+| 13 | requirement_extractor.py + code_verifier.py | ✅ | 现有 LLM factory |
+| 14 | code_generator.py（CLI subprocess，无 API key） | ✅ | claude CLI + OAuth |
+| 15 | project.py (generate-code WebSocket + download-repo) | ✅ | code_generator |
+| 16 | project/page.tsx (Step 4) + GlobalContext startCodeGeneration | ✅ | 后端 Phase 3 |
+| 17 | 端到端集成测试 | ⬜ | 全部完成 |
 
 ---
 
@@ -973,34 +939,38 @@ async def test_code_generator_sdk_fallback():
 
 ```bash
 # Python（deeptutor 环境）
-pip install claude-agent-sdk    # Claude Agent SDK
-# python-docx 已安装（deeptutor 环境）
+# python-docx 已安装（deeptutor 环境），无需额外安装
+# claude-agent-sdk 不需要（已放弃该方案）
 
-# 环境变量（.env 新增）
-ANTHROPIC_API_KEY=sk-ant-xxx    # 代码生成需要
+# 环境变量（.env）
+# ANTHROPIC_API_KEY 不需要（代码生成走 OAuth，不走 API key）
+# 任务书生成（Phase 1）继续使用 DASHSCOPE_API_KEY / 字节 API key
 
-# Claude CLI（可选降级方案）
+# Claude CLI（必须安装并登录，代码生成的唯一入口）
 npm install -g @anthropic-ai/claude-code
+claude login    # 浏览器完成 OAuth 授权，凭据存入 ~/.claude/.credentials.json
 ```
 
 ---
 
 ## 关键文件路径速查
 
-| 文件 | 路径 | 操作 |
-|------|------|------|
-| 路由 | `src/api/routers/project.py` | 新建 |
-| 协调器 | `src/agents/project/coordinator.py` | 新建 |
-| 文档解析 | `src/agents/project/agents/task_parser.py` | 新建 |
-| 任务书生成 | `src/agents/project/agents/task_generator.py` | 新建 |
-| 代码生成 | `src/agents/project/agents/code_generator.py` | 新建 |
-| 会话管理 | `src/agents/project/session_manager.py` | 新建 |
-| 路由注册 | `src/api/main.py` | 修改 ~L195 |
-| 侧边栏 | `web/components/Sidebar.tsx` | 修改 L42-53, L8-28 |
-| 全局状态 | `web/context/GlobalContext.tsx` | 修改 多处 |
-| 前端页面 | `web/app/project/page.tsx` | 新建 |
-| 提示词(中) | `src/agents/project/prompts/zh/*.yaml` | 新建 |
-| 参考路由 | `src/api/routers/question.py` | 只读参考 |
-| 参考 Agent | `src/agents/question/coordinator.py` | 只读参考 |
-| 参考会话 | `src/agents/solve/session_manager.py` | 只读参考 |
-| 参考页面 | `web/app/question/page.tsx` | 只读参考 |
+| 文件 | 路径 | 操作 | 状态 |
+|------|------|------|------|
+| 路由 | `src/api/routers/project.py` | 新建 | ✅ |
+| 协调器 | `src/agents/project/coordinator.py` | 新建 | ✅ |
+| 文档解析 | `src/agents/project/agents/task_parser.py` | 新建 | ✅ |
+| 任务书生成 | `src/agents/project/agents/task_generator.py` | 新建 | ✅ |
+| 需求提取 | `src/agents/project/agents/requirement_extractor.py` | 新建 | ✅ |
+| 代码生成 | `src/agents/project/agents/code_generator.py` | 新建 | ✅ |
+| 代码验证 | `src/agents/project/agents/code_verifier.py` | 新建 | ✅ |
+| 会话管理 | `src/agents/project/session_manager.py` | 新建 | ✅ |
+| 路由注册 | `src/api/main.py` | 修改 | ✅ |
+| 侧边栏 | `web/components/Sidebar.tsx` | 修改 | ✅ |
+| 全局状态 | `web/context/GlobalContext.tsx` | 修改 | ✅ |
+| 前端页面 | `web/app/project/page.tsx` | 新建 | ✅ |
+| 提示词(中) | `src/agents/project/prompts/zh/*.yaml` | 新建 | ✅ |
+| 参考路由 | `src/api/routers/question.py` | 只读参考 | — |
+| 参考 Agent | `src/agents/question/coordinator.py` | 只读参考 | — |
+| 参考会话 | `src/agents/solve/session_manager.py` | 只读参考 | — |
+| 参考页面 | `web/app/question/page.tsx` | 只读参考 | — |

@@ -266,6 +266,12 @@ interface ProjectState {
   currentSection: string | null;
   taskMdPath: string | null;
   taskDocxPath: string | null;
+  // Code generation (Phase 3)
+  agentLogs: AgentLogEntry[];
+  generatedFiles: FileTreeNode[];
+  repoPath: string | null;
+  verifyPassed: boolean | null;
+  coverageMap: Record<string, string[]> | null;
   // Common
   sessionId: string | null;
   logs: LogEntry[];
@@ -362,6 +368,7 @@ interface GlobalContextType {
   setProjectState: React.Dispatch<React.SetStateAction<ProjectState>>;
   uploadReference: (file: File) => Promise<void>;
   startTaskGeneration: () => void;
+  startCodeGeneration: () => void;
   resetProject: () => void;
 
   // Persistence utilities
@@ -498,6 +505,11 @@ const DEFAULT_PROJECT_STATE: ProjectState = {
   currentSection: null,
   taskMdPath: null,
   taskDocxPath: null,
+  agentLogs: [],
+  generatedFiles: [],
+  repoPath: null,
+  verifyPassed: null,
+  coverageMap: null,
   sessionId: null,
   logs: [],
   tokenStats: { model: "Unknown", calls: 0, tokens: 0, input_tokens: 0, output_tokens: 0, cost: 0 },
@@ -2301,6 +2313,115 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
     setProjectState(DEFAULT_PROJECT_STATE);
   }, []);
 
+  const startCodeGeneration = useCallback(() => {
+    if (projectWs.current) projectWs.current.close();
+
+    setProjectState((prev) => ({
+      ...prev,
+      step: "code_generating",
+      agentLogs: [],
+      generatedFiles: [],
+      repoPath: null,
+      verifyPassed: null,
+      coverageMap: null,
+      error: null,
+    }));
+
+    const base = process.env.NEXT_PUBLIC_API_BASE || "";
+    const wsBase = base.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+    const ws = new WebSocket(`${wsBase}/api/v1/project/generate-code`);
+    projectWs.current = ws;
+
+    ws.onopen = () => {
+      ws.send(
+        JSON.stringify({
+          session_id: projectStateRef.current.sessionId,
+          task_content: projectStateRef.current.taskContent,
+        })
+      );
+    };
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      switch (data.type) {
+        case "phase":
+          setProjectState((prev) => ({
+            ...prev,
+            logs: [
+              ...prev.logs,
+              { type: "status", content: data.content, timestamp: Date.now() },
+            ],
+          }));
+          break;
+        case "agent_log":
+          setProjectState((prev) => ({
+            ...prev,
+            agentLogs: [
+              ...prev.agentLogs.slice(-499),  // 最多保留 500 条
+              {
+                timestamp: new Date().toLocaleTimeString(),
+                type: data.log_type,
+                tool: data.tool,
+                path: data.path,
+                content: data.content,
+              },
+            ],
+          }));
+          break;
+        case "file_created":
+          // 文件树在 complete 消息中整体更新
+          break;
+        case "verify_result":
+          setProjectState((prev) => ({
+            ...prev,
+            logs: [
+              ...prev.logs,
+              {
+                type: data.passed ? "status" : "error",
+                content: data.passed
+                  ? `验证通过：${data.report}`
+                  : `验证失败：${data.report}`,
+                timestamp: Date.now(),
+              },
+            ],
+          }));
+          break;
+        case "coverage":
+          setProjectState((prev) => ({ ...prev, coverageMap: data.map }));
+          break;
+        case "complete":
+          setProjectState((prev) => ({
+            ...prev,
+            step: "complete",
+            repoPath: data.repo_path,
+            generatedFiles: data.file_tree,
+            coverageMap: data.coverage_map,
+            verifyPassed: data.verify_passed,
+          }));
+          break;
+        case "error":
+          setProjectState((prev) => ({
+            ...prev,
+            step: "task_review",
+            error: data.content,
+          }));
+          break;
+      }
+    };
+
+    ws.onerror = () => {
+      setProjectState((prev) => ({
+        ...prev,
+        step: "task_review",
+        error: "WebSocket 连接错误",
+      }));
+    };
+
+    ws.onclose = () => {
+      if (projectWs.current === ws) projectWs.current = null;
+    };
+  }, []);
+
   // --- Clear All Persistence ---
   const clearAllPersistence = useCallback(() => {
     // Import clearAllStorage dynamically to avoid circular dependencies
@@ -2359,6 +2480,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
         setProjectState,
         uploadReference,
         startTaskGeneration,
+        startCodeGeneration,
         resetProject,
         clearAllPersistence,
       }}
